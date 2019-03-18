@@ -1,0 +1,331 @@
+#!/bin/bash
+# Copyright (c) 2019, Stein Gunnar Bakkeby, all rights reserved.
+#
+# kvstore is a (relatively) simple key-value storage tool aimed
+# as a lookup tool for scripts and cron jobs.
+
+func_name=$(basename ${BASH_SOURCE[0]})
+hostname=$(hostname)
+
+if [[ $# == 0 ]]; then
+	set -- '-h'
+fi
+
+GLOBAL_COMPARISON_METHOD=max
+QUIET=""
+
+FILES=()
+
+# Initial parse of command line arguments
+while (( $# )); do
+	case "$1" in
+	-g|--global)
+		shift
+		hostname='*'
+		;;
+	-f|--filename)
+		shift
+		FILES+=("${1}")
+		shift
+		;;
+	--host|--hostname)
+		shift
+		hostname=${1}
+		shift
+		;;
+	--min|--minimum)
+		shift
+		GLOBAL_COMPARISON_METHOD=min
+		;;
+	-q|--quiet)
+		shift
+		QUIET=1
+		;;
+	-h|--help)
+		shift
+		args_format="  %-31s%s\n"
+		
+		printf "%s\n\n" "Usage: ${func_name} [OPTION?] [KEY?]"
+		printf "%s\n\n" "Stores arbitrary key-value pairs for script lookup purposes."
+		printf "$args_format" "-a, --add <value> <key>" "adds value with the given key"
+		printf "$args_format" "-u, --update <value> <key>" "alias for the above"
+		printf "$args_format" "-l, --list" "lists current keys and values"
+		printf "$args_format" "-r, --remove <key>" "removes a given key"
+		printf "$args_format" "    --clear" "removes all keys"
+		printf "$args_format" "-h, --help" "display this help section"
+		printf "$args_format" "-k, --keys" "lists current keys"
+		printf "$args_format" "-g, --global" "apply action to all host files"
+		printf "$args_format" "-f, --file" "specify data file to store keys in rather than"
+		printf "$args_format" "" "using the default"
+		printf "$args_format" "    --locate" "list location of data file"
+		printf "$args_format" "    --hostname <name>" "apply action to specific host file"
+		printf "$args_format" "-q, --quiet" "avoid printing to standard out when adding and"
+		printf "$args_format" "" "removing files (recommended for scripts)"
+		printf "\n%s\n" "Examples:"
+		printf "$args_format" "${func_name} -a value key" "stores \"value\" with the key \"key\""
+		printf "$args_format" "${func_name} -l" "list stored keys and values"
+		printf "$args_format" "${func_name} key" "returns the value associated with the key \"key\""
+		printf "$args_format" "${func_name} -r key" "removes the stored key \"key\""
+		printf "\n%s\n" "Warning! Please return all lost keys to the reception."
+		echo
+
+		exit
+		;;
+	*) # all other parameters
+		PARAMS[${#PARAMS[*]}]=${1}
+		shift
+		;;
+	esac
+done
+
+set -- "${PARAMS[@]}"
+
+typeset -A row
+
+if [[ -z "$FILES" ]]; then
+	FILES=(${_KVSTORESETTINGS_STORE_DIR:-~}/.${func_name}.${hostname}.db)
+fi
+
+keys=()
+
+for filename in "${FILES[@]}"; do
+
+	if [[ ! -f "$filename" ]]; then
+		continue
+	fi
+
+	while IFS="" read -r line || [ -n "$line" ]; do
+		if [[ -z "$line" ]]; then
+			continue
+		fi
+		key=${line%%=*}
+		row[${filename}¦${key}]=${line#*=}
+		found=0
+		for k in ${keys[*]}; do
+			if [[ "$k" = "$key" ]]; then
+				found=1
+				break
+			fi
+		done
+		if [[ "$found" = 0 ]]; then
+			keys+=($key)
+		fi
+
+	done < "$filename"
+done
+IFS=$'\n'
+
+dirty=0
+
+while (( $# )); do
+	case "$1" in
+	-u|--update)
+		;& # falls through
+	-a|--add)
+		shift
+		key=""
+		case "$#" in
+		0|1)
+			echo "Usage: ${func_name} -a <value> <key>"
+			exit
+			;;
+		*)
+			val=$1
+			key=$2
+			shift 2
+			;;
+		esac
+		
+		if [[ -d "$val" ]]; then
+			val=$(realpath "$val")
+		fi
+		
+		if [[ "$key" = "" ]]; then
+			key=${val##*/}
+			if [ $ZSH_VERSION ]; then
+				key=$key:l
+			else
+				key=${key,,}
+			fi
+		fi
+		
+		# No support for spaces in keys
+		key=${key//[ ]/}
+		
+		if [[ -z "$key" ]]; then
+			echo "Please specify the key to store this value as"
+		else
+			for filename in "${FILES[@]}"; do
+				row[${filename}¦${key}]=$val
+			done
+			found=0
+			for k in ${keys[*]}; do
+				if [[ "$k" = "$key" ]]; then
+					found=1
+					break
+				fi
+			done
+			if [[ "$found" = 0 ]]; then
+				keys+=($key)
+			fi
+
+			if [[ -z $QUIET ]]; then
+				if [[ "$found" = 1 ]]; then
+					echo "Updated key \"$key\" with value of $val"
+				else
+					echo "Added key \"$key\" with value of $val"
+				fi
+			fi
+			dirty=1
+		fi
+		;;
+	-r|--remove)
+		shift
+		case "$#" in
+		0)
+			key=${$(pwd)##*/}
+			;;
+		*)
+			key=$1
+			shift
+			;;
+		esac
+		
+		for filename in "${FILES[@]}"; do
+			if [[ ! -z ${row[${filename}¦${key}]} ]]; then
+				val=${row[${filename}¦${key}]}
+				unset "row[${filename}¦${key}]"
+				if [[ -z $QUIET ]]; then
+					if [[ ${#FILES[*]} > 1 ]]; then
+						echo "Key '${key}' with value '${val}' removed from ${filename##*/}"
+					else
+						echo "Key '${key}' with value ${val} removed"
+					fi
+				fi
+				dirty=1
+			fi
+		done
+
+		if [[ "$dirty" = 0 ]] && [[ -z $QUIET ]]; then
+			echo "Key $key does not exist"
+		fi
+		;;
+	--clear)
+		shift
+		for filename in "${FILES[@]}"; do
+			if [[ -e "$filename" ]]; then
+				rm -f -- "$filename"
+				if [[ ${#FILES[*]} > 1 ]] && [[ -z $QUIET ]]; then
+					echo "Removed file $filename"
+				fi
+			fi
+		done
+		;;
+	--locate)
+		shift
+		for filename in "${FILES[@]}"; do
+			echo "$filename"
+		done
+		;;
+	-k|--keys)
+		shift
+		echo "${keys[*]}"
+		;;
+	-o)
+		shift
+		# Internal option used for tab completion purposes
+		echo "-a --add -l --list -r --remove --clear --purge -g --global --hostname -h --help"\
+			 "-k --keys --locate"
+		;;
+	--) # end argument parsing
+		shift
+		break
+		;;
+	--*=) # unsupported flags
+		echo "Error: Unsupported flag $1" >&2
+		shift
+		;;
+	-l|--list)
+		if [[ ${#row[@]} = 0 ]]; then
+			echo "No keys stored yet, try adding one with \"${func_name} -a key value\""
+			break
+		fi
+
+		if [[ ${#FILES[*]} > 1 ]]; then
+			list_format="%-56s%-10s%s\n"
+			printf "$list_format" 'Key' 'Location' "${GLOBAL_COMPARISON_METHOD^} value"
+		else
+			list_format="%-56s%s\n"
+			printf "$list_format" 'Key' 'Value'
+		fi
+		LIST_KEYS=${keys[*]}
+		;& # falls through
+	--lookup)
+		shift
+		;& # falls through
+	*)
+		# Combines both list and lookup
+		for key in ${LIST_KEYS[@]:-$1}; do
+			SELECTED_VAL=
+			SELECTED_HOST=
+			
+			if [[ "$GLOBAL_COMPARISON_METHOD" = "min" ]]; then
+				OPERATOR='<'
+			else
+				OPERATOR='>'
+			fi
+
+			# For each key, find the maximum value across all files.
+			# For example let's say that we have a job that runs on multiple machines or servers
+			# and we record the timestamp when the job last ran. By default when looking up or
+			# listing values the stored data for the current host is displayed. If we do a global
+			# lookup then we want to show the most recent timestamp.
+			# The comparison is lexiographical, so dates on the form of yyyy-mm-dd HH:MM:SS
+			# is highly recommended.
+			for filename in "${FILES[@]}"; do
+				VAL=${row[${filename}¦${key}]}
+				if [[ ! -z "$VAL" ]]; then
+					unset FOUND
+					if [[ -z "$SELECTED_VAL" ]]; then
+						FOUND=1
+					# Handle integer / decimal comparison 
+					elif [[ "$VAL" =~ ^[0-9.]+$ ]] && [[ "$SELECTED_VAL" =~ ^[0-9.]+$ ]]; then
+						FOUND=$(echo "${VAL} ${OPERATOR} ${SELECTED_VAL}" | bc)
+					# Handle lexiographical comparison
+					elif [[ "$OPERATOR" = "<" ]] && [[ "$VAL" < "$SELECTED_VAL" ]] ||
+						 [[ "$OPERATOR" = ">" ]] && [[ "$VAL" > "$SELECTED_VAL" ]]; then
+						FOUND=1
+					fi 
+
+					if [[ "$FOUND" = 1 ]]; then
+						SELECTED_VAL="$VAL"
+						SELECTED_HOST="${filename##*/.${func_name}.}"
+						SELECTED_HOST="${SELECTED_HOST%.db}"
+					fi
+				fi
+			done
+
+			if [[ -z "${LIST_KEYS[@]}" ]]; then
+				echo "$SELECTED_VAL" # lookup
+			elif [[ ${#FILES[*]} > 1 ]]; then
+				printf "$list_format" "$key" "${SELECTED_HOST}" "${SELECTED_VAL}" 
+			else
+				printf "$list_format" "$key" "${SELECTED_VAL}"
+			fi
+		done
+		break
+		;;
+	esac
+done
+
+if [[ $dirty == 1 ]]; then
+	for filename in "${FILES[@]}"; do
+		output=''
+		for key in ${keys[*]}; do
+			if [[ ! -z "${row[${filename}¦${key}]}" ]]; then
+				output="${output}${key}=${row[${filename}¦${key}]}\n"
+			fi
+		done
+		echo -e $output > "$filename"
+	done
+fi
